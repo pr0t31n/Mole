@@ -1,0 +1,20 @@
+# Mole is a Go project — no Python runtime dependencies.
+# This file documents the Go module dependencies for reference.
+#
+# Go module: github.com/mole
+# Go version: 1.22
+#
+# Direct Go dependencies (see go.mod):
+#   github.com/miekg/dns v1.1.58        — DNS message parsing (Miek Gieben @miekg)
+#   golang.org/x/net v0.52.0            — SOCKS5 client dialer (Go Authors)
+#   golang.org/x/sys v0.42.0            — SO_ORIGINAL_DST syscall Linux transparent proxy
+#   gopkg.in/yaml.v3 v3.0.1             — YAML config parsing (Canonical / go-yaml team)
+#
+# Indirect Go dependencies (see go.sum):
+#   golang.org/x/mod v0.34.0
+#   golang.org/x/sync v0.20.0
+#   golang.org/x/tools v0.42.0
+#
+# Build requirements:
+#   Go 1.22+
+#   git (for version tagging in build.sh)

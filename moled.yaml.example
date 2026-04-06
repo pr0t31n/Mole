@@ -1,0 +1,82 @@
+# =============================================================================
+# ProxySuite Server — Configuration File
+# =============================================================================
+#
+# Default location: /etc/proxysuite/server-config.yaml
+#
+# After editing, restart the service:
+#   sudo systemctl restart proxysuite-server
+#
+# View live logs:
+#   sudo journalctl -u proxysuite-server -f
+#
+# View file-based logs:
+#   ls /var/log/proxysuite/
+# =============================================================================
+
+
+# ── Network binding ────────────────────────────────────────────────────────────
+#
+server:
+  # Address to bind both listeners on.
+  # "0.0.0.0" listens on all interfaces (recommended when behind a firewall).
+  # To restrict to the VPN interface only, use its IP, e.g. "10.8.0.1".
+  bind_address: "0.0.0.0"
+
+  # SOCKS5 proxy port.  Clients connect here to tunnel TCP traffic.
+  # Default: 1080.  Must be opened in the firewall (TCP inbound).
+  socks5_port: 1080
+
+  # DNS proxy port.  Clients send DNS-over-TCP here (via the SOCKS5 tunnel).
+  # Default: 5353.  Must be opened in the firewall (TCP + UDP inbound).
+  # Note: port 53 requires root; 5353 does not (recommended).
+  dns_port: 5353
+
+
+# ── Authentication ─────────────────────────────────────────────────────────────
+#
+# When enabled, clients must supply a matching username and password.
+# Uses SOCKS5 username/password sub-negotiation (RFC 1929).
+# Credentials are sent in plaintext — only enable over an encrypted VPN tunnel.
+#
+auth:
+  enabled: false        # Set to true to require credentials
+
+  username: ""          # e.g. "proxyuser"
+  password: ""          # e.g. "ChangeMe123!"
+
+
+# ── Upstream DNS ───────────────────────────────────────────────────────────────
+#
+# The DNS resolver the SERVER uses to answer client queries.
+# This should be a reliable, public DNS server reachable from the server.
+#
+# Common choices:
+#   "1.1.1.1:53"   — Cloudflare (fast, privacy-focused)
+#   "8.8.8.8:53"   — Google Public DNS
+#   "9.9.9.9:53"   — Quad9 (malware-blocking)
+#   "208.67.222.222:53" — OpenDNS
+#
+upstream_dns: "1.1.1.1:53"
+
+
+# ── Logging ────────────────────────────────────────────────────────────────────
+#
+logging:
+  # Directory where log files are written.
+  # The service user (proxysuite) must have write access.
+  # Created automatically by the installer.
+  dir: "/var/log/proxysuite"
+
+  # When true: all events are printed to stdout (visible in journalctl).
+  # When false: only errors appear in stdout; all events still go to files.
+  verbose: true
+
+  # How many days to keep connection log files (server_connections_YYYY-MM-DD.log).
+  # Files older than this are deleted automatically at midnight UTC.
+  # 0 = keep forever.
+  connection_retain_days: 90
+
+  # How many days to keep error log files (server_errors_YYYY-MM-DD.log).
+  # 0 = keep forever.
+  error_retain_days: 30

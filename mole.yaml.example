@@ -1,0 +1,124 @@
+# =============================================================================
+# ProxySuite Client Configuration  —  config.yaml.example
+# =============================================================================
+#
+# QUICK START:
+#   1. Copy this file:   cp config.yaml.example config.yaml
+#   2. Set the server host(s) under "servers:" below
+#   3. Test:             sudo ./proxy-client --config config.yaml --check
+#   4. Run:              sudo ./proxy-client --config config.yaml
+#
+# HOW IT WORKS (Linux):
+#   iptables intercepts every outbound TCP connection transparently and tunnels
+#   it through SOCKS5.  DNS queries are captured at 127.0.0.1:53 and tunnelled
+#   via the same SOCKS5 connection so the network-controlled DNS is bypassed.
+#   Applications need no configuration changes.
+#
+# HOW IT WORKS (macOS / Windows):
+#   System proxy settings (networksetup / registry) are applied automatically.
+#   Most applications that respect OS proxy settings are covered.
+#
+# REQUIREMENT:
+#   The VPN must be connected before running the client so the server IPs below
+#   are reachable over the VPN tunnel.
+# =============================================================================
+
+# -----------------------------------------------------------------------------
+# servers — List of proxy servers to try, in priority order.
+#
+# The client probes each server in turn.  The first to respond is used.
+# On failure, restart the client to re-probe and fail over.
+#
+# Fields:
+#   name        Human-readable label (appears in log messages).
+#   host        Server IP or hostname — must be reachable via VPN.
+#   socks5_port SOCKS5 proxy port (matches server-config.yaml socks5_port).
+#   dns_port    TCP DNS proxy port (matches server-config.yaml dns_port).
+# -----------------------------------------------------------------------------
+servers:
+  - name: "Primary"
+    host: "10.8.0.1"
+    socks5_port: 1080
+    dns_port: 5353
+
+  - name: "Backup"
+    host: "10.8.0.2"
+    socks5_port: 1080
+    dns_port: 5353
+
+  # Add more servers as needed — tried in order until one succeeds.
+  # - name: "DR-Site"
+  #   host: "10.8.0.10"
+  #   socks5_port: 1080
+  #   dns_port: 5353
+
+# -----------------------------------------------------------------------------
+# auth — SOCKS5 credentials.
+#   Leave empty when server has auth.enabled: false (the default).
+#   Must match server-config.yaml auth section exactly if auth is enabled.
+# -----------------------------------------------------------------------------
+auth:
+  username: ""   # example: "proxyuser"
+  password: ""   # example: "MyStr0ngP@ss"
+
+# -----------------------------------------------------------------------------
+# local — Ports used by the proxy daemons running on THIS machine.
+#
+# dns_port    : Local DNS proxy.  /etc/resolv.conf → 127.0.0.1 points here.
+#               Port 53 requires root.  If running rootless, use 5300 and
+#               set local.dns_port: 5300 — iptables will redirect 53→5300.
+#
+# socks5_port : Local transparent proxy (Linux iptables target) or system
+#               SOCKS5 proxy port (macOS/Windows).
+# -----------------------------------------------------------------------------
+local:
+  dns_port: 53       # requires root / Administrator
+  socks5_port: 1081
+
+# -----------------------------------------------------------------------------
+# network — Connection and routing behaviour.
+# -----------------------------------------------------------------------------
+network:
+  # Traffic to these CIDRs bypasses the proxy and goes direct.
+  # RFC-1918 and loopback are always bypassed even if omitted here.
+  # Add your VPN subnet if it is outside the RFC-1918 ranges (e.g., Tailscale).
+  bypass_networks:
+    - "10.0.0.0/8"
+    - "172.16.0.0/12"
+    - "192.168.0.0/16"
+    # - "100.64.0.0/10"   # Uncomment for Tailscale / CGNAT ranges
+
+  # Seconds to wait when probing a server before declaring it unreachable.
+  connect_timeout_sec: 10
+
+  # How many times to retry a single server before giving up on it.
+  retry_attempts: 3
+
+  # Seconds to wait between retry attempts for the same server.
+  retry_delay_sec: 2
+
+# -----------------------------------------------------------------------------
+# dns — DNS tunnelling configuration.
+#
+# upstream_dns: The DNS resolver the proxy server contacts on your behalf.
+#   All DNS queries from this machine are sent through the SOCKS5 tunnel to
+#   this server, completely bypassing any DNS servers imposed by the local
+#   network.
+#   Common choices:
+#     8.8.8.8:53   — Google Public DNS
+#     1.1.1.1:53   — Cloudflare
+#     9.9.9.9:53   — Quad9 (malware-blocking)
+# -----------------------------------------------------------------------------
+dns:
+  upstream_dns: "8.8.8.8:53"
+
+# -----------------------------------------------------------------------------
+# logging — Client-side verbosity.
+#
+# Log files are written to ~/.proxysuite/logs/ on Linux/macOS.
+# They rotate daily and are retained for 90 days (conn) / 30 days (errors).
+# verbose: true  → every event is also printed to stdout.
+# verbose: false → only errors appear on stdout; events go to files only.
+# -----------------------------------------------------------------------------
+logging:
+  verbose: true
