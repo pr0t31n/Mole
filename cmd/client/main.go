@@ -29,11 +29,6 @@ import (
 	"time"
 
 	// golang.org/x/net/proxy — SOCKS5 dialer by The Go Authors / Google (https://pkg.go.dev/golang.org/x/net/proxy)
-
-// version is the default version string, overridden at build time via:
-//   -ldflags="-X main.version=<tag>"
-// (see build.sh)
-var version = "1.0.0"
 	"golang.org/x/net/proxy"
 
 	"github.com/mole/internal/config"
@@ -42,6 +37,11 @@ var version = "1.0.0"
 	"github.com/mole/internal/platform"
 	"github.com/mole/internal/transparent"
 )
+
+// version is the default version string, overridden at build time via:
+//   -ldflags="-X main.version=<tag>"
+// (see build.sh)
+var version = "1.0.0"
 
 func main() {
 	configPath := flag.String("config", "config.yaml", "Path to YAML configuration file")
