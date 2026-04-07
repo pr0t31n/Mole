@@ -18,11 +18,6 @@
 //  6. On SIGINT/SIGTERM, reverts all changes and exits cleanly.
 package main
 
-// version is the default version string, overridden at build time via:
-//   -ldflags="-X main.version=<tag>"
-// (see build.sh)
-var version = "1.0.0"
-
 import (
 	"flag"
 	"fmt"
@@ -34,6 +29,11 @@ import (
 	"time"
 
 	// golang.org/x/net/proxy — SOCKS5 dialer by The Go Authors / Google (https://pkg.go.dev/golang.org/x/net/proxy)
+
+// version is the default version string, overridden at build time via:
+//   -ldflags="-X main.version=<tag>"
+// (see build.sh)
+var version = "1.0.0"
 	"golang.org/x/net/proxy"
 
 	"github.com/mole/internal/config"
