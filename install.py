@@ -1,15 +1,7 @@
 #!/usr/bin/env python3
 """
-install.py — Mole build & dependency installer
-===============================================
-Detects Linux or macOS and installs all required build tools for Mole.
-Mole is a Go project — this script ensures Go and build prerequisites are
-present, then builds the Mole binaries for the current platform.
-
-Usage:
-    python3 install.py            # install deps + build
-    python3 install.py --deps-only  # install deps only, skip build
-    python3 install.py --build-only # skip dep install, just build
+Mole — Go TCP/DNS transparent proxy
+Install script for /opt/pr0t31n/Mole/
 """
 
 import argparse
@@ -18,252 +10,460 @@ import platform
 import shutil
 import subprocess
 import sys
+import tarfile
+import urllib.request
+from pathlib import Path
 
-VERSION = "1.0.0"
+# ─── ANSI colours ────────────────────────────────────────────────────────────
+R  = "\033[1;31m"
+G  = "\033[1;32m"
+Y  = "\033[1;33m"
+B  = "\033[1;34m"
+C  = "\033[1;36m"
+W  = "\033[0m"
+# ─────────────────────────────────────────────────────────────────────────────
 
-# ── Platform detection ────────────────────────────────────────────────────────
-SYSTEM = platform.system()
-IS_LINUX = SYSTEM == "Linux"
-IS_MACOS = SYSTEM == "Darwin"
+APP_NAME    = "Mole"
+APP_DIR     = Path("/opt/pr0t31n/Mole")
+DIST_DIR    = APP_DIR / "dist"
+BIN_DIR     = Path("/usr/local/bin")
 
-# Minimum required Go version (major.minor)
-MIN_GO_MAJOR = 1
-MIN_GO_MINOR = 22
+GO_MIN      = (1, 22)
+GO_VERSION  = "1.22.5"
+GO_LINUX    = f"https://go.dev/dl/go{GO_VERSION}.linux-amd64.tar.gz"
+GO_MACOS    = f"https://go.dev/dl/go{GO_VERSION}.darwin-amd64.tar.gz"
+GO_INSTALL  = Path("/usr/local/go")
 
-# ── Colours ───────────────────────────────────────────────────────────────────
-def _c(code: str, text: str) -> str:
-    """Apply ANSI colour if stdout is a terminal."""
-    if sys.stdout.isatty():
-        return f"\033[{code}m{text}\033[0m"
-    return text
+SYMLINKS = {
+    "mole-client": DIST_DIR / "mole-client",
+    "mole-agent":  DIST_DIR / "mole-agent",
+}
 
-def info(msg: str)    -> None: print(_c("36", f"[INFO]  {msg}"))
-def ok(msg: str)      -> None: print(_c("32", f"[OK]    {msg}"))
-def warn(msg: str)    -> None: print(_c("33", f"[WARN]  {msg}"), file=sys.stderr)
-def error(msg: str)   -> None: print(_c("31", f"[ERROR] {msg}"), file=sys.stderr)
-def section(msg: str) -> None: print(_c("35", f"\n{'='*60}\n  {msg}\n{'='*60}"))
+# system package lists --------------------------------------------------------
+APT_PKGS    = ["golang-go", "git", "make", "gcc", "libc6-dev",
+               "curl", "wget", "ca-certificates", "build-essential"]
+DNF_PKGS    = ["golang", "git", "make", "gcc", "glibc-devel",
+               "curl", "wget", "ca-certificates"]
+ZYPPER_PKGS = ["go", "git", "make", "gcc", "glibc-devel",
+               "curl", "wget", "ca-certificates"]
+BREW_PKGS   = ["go", "git", "curl", "wget"]
+
+# ─── helpers ─────────────────────────────────────────────────────────────────
+
+def banner():
+    print(f"""
+{C}╔══════════════════════════════════════════════╗
+║        Mole — Go TCP/DNS Transparent Proxy   ║
+║        Install Script                        ║
+╚══════════════════════════════════════════════╝{W}
+""")
 
 
-# ── Shell helpers ─────────────────────────────────────────────────────────────
-def run(cmd: list, check: bool = True, env: dict = None) -> subprocess.CompletedProcess:
-    """Run a command, stream output, and optionally raise on failure."""
-    info(f"Running: {' '.join(cmd)}")
-    merged_env = {**os.environ, **(env or {})}
-    result = subprocess.run(cmd, env=merged_env)
-    if check and result.returncode != 0:
-        error(f"Command failed (exit {result.returncode}): {' '.join(cmd)}")
-        sys.exit(result.returncode)
+def info(msg):  print(f"{G}[+]{W} {msg}")
+def warn(msg):  print(f"{Y}[!]{W} {msg}")
+def err(msg):   print(f"{R}[✗]{W} {msg}")
+def step(msg):  print(f"\n{B}━━ {msg} ━━{W}")
+
+
+def run(cmd, **kwargs):
+    """Run a command; raise on non-zero exit."""
+    print(f"    {C}>{W} {' '.join(str(c) for c in cmd)}")
+    result = subprocess.run(cmd, **kwargs)
+    if result.returncode != 0:
+        raise RuntimeError(f"Command failed: {' '.join(str(c) for c in cmd)}")
     return result
 
 
-def cmd_exists(name: str) -> bool:
-    """Return True if *name* resolves to an executable on PATH."""
-    return shutil.which(name) is not None
-
-
-# ── Go version check ──────────────────────────────────────────────────────────
-def check_go_version() -> bool:
-    """
-    Return True if Go >= MIN_GO_MAJOR.MIN_GO_MINOR is on PATH.
-    Prints what was found (or not found).
-    """
-    if not cmd_exists("go"):
-        return False
-    result = subprocess.run(["go", "version"], capture_output=True, text=True)
-    line = result.stdout.strip()  # e.g. "go version go1.22.3 linux/amd64"
-    info(f"Found: {line}")
-    parts = line.split()
-    if len(parts) < 3:
-        return False
-    ver = parts[2].lstrip("go")  # "1.22.3"
+def run_ok(cmd, **kwargs):
+    """Run a command; return True on success, False on failure (no raise)."""
     try:
-        major, minor = int(ver.split(".")[0]), int(ver.split(".")[1])
-        return (major, minor) >= (MIN_GO_MAJOR, MIN_GO_MINOR)
-    except (IndexError, ValueError):
+        subprocess.run(cmd, check=True,
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                       **kwargs)
+        return True
+    except (subprocess.CalledProcessError, FileNotFoundError):
         return False
 
 
-# ── Linux: install with apt ───────────────────────────────────────────────────
-def install_linux() -> None:
-    section("Installing system dependencies (apt)")
-
-    if os.geteuid() != 0:
-        warn("Not running as root — apt installs may fail. Consider re-running with sudo.")
-
-    info("Updating apt package list…")
-    run(["apt-get", "update", "-y"])
-
-    apt_packages = [
-        "git",
-        "make",
-        "gcc",
-        "libc6-dev",
-        "curl",
-        "wget",
-        "ca-certificates",
-    ]
-    info(f"Installing packages: {', '.join(apt_packages)}")
-    run(["apt-get", "install", "-y"] + apt_packages)
-    ok("System packages installed.")
-
-    if not check_go_version():
-        info("Go not found or version too old — installing Go via official tarball…")
-        _install_go_linux()
-    else:
-        ok(f"Go >= {MIN_GO_MAJOR}.{MIN_GO_MINOR} already available.")
-
-
-def _install_go_linux() -> None:
-    """Download and install the latest stable Go for Linux amd64."""
-    GO_VERSION = "1.22.3"
-    tarball = f"go{GO_VERSION}.linux-amd64.tar.gz"
-    url = f"https://go.dev/dl/{tarball}"
-
-    info(f"Downloading Go {GO_VERSION} from {url}…")
-    run(["curl", "-fsSL", "-o", f"/tmp/{tarball}", url])
-    run(["rm", "-rf", "/usr/local/go"])
-    run(["tar", "-C", "/usr/local", "-xzf", f"/tmp/{tarball}"])
-    os.environ["PATH"] = f"/usr/local/go/bin:{os.environ.get('PATH', '')}"
-    ok(f"Go {GO_VERSION} installed to /usr/local/go")
-    info("Add /usr/local/go/bin to your PATH permanently:")
-    info("  echo 'export PATH=$PATH:/usr/local/go/bin' >> ~/.bashrc")
-
-
-# ── macOS: install with brew ──────────────────────────────────────────────────
-def install_macos() -> None:
-    section("Installing system dependencies (brew)")
-
-    if not cmd_exists("brew"):
-        warn("Homebrew not found. Installing Homebrew…")
-        run([
-            "/bin/bash", "-c",
-            "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
-        ])
-
-    brew_packages = ["go", "git", "curl", "wget"]
-    _brew_user = os.environ.get("SUDO_USER", "")
-    _brew_pfx  = ["sudo", "-u", _brew_user] if _brew_user and _brew_user != "root" else []
-    for pkg in brew_packages:
-        info(f"Installing {pkg} via brew…")
-        run(_brew_pfx + ["brew", "install", pkg], check=False)
-
-    if not check_go_version():
-        warn(f"Go >= {MIN_GO_MAJOR}.{MIN_GO_MINOR} still not found after brew install.")
-        warn("Ensure /opt/homebrew/bin or /usr/local/bin is on your PATH.")
-    else:
-        ok(f"Go >= {MIN_GO_MAJOR}.{MIN_GO_MINOR} is available.")
-
-
-# ── Build ─────────────────────────────────────────────────────────────────────
-def build() -> None:
-    section("Building Mole binaries")
-
-    script_dir = os.path.dirname(os.path.abspath(__file__))
-    build_script = os.path.join(script_dir, "build.sh")
-
-    if not os.path.isfile(build_script):
-        error(f"build.sh not found at {build_script}")
+def require_root():
+    if platform.system() != "Darwin" and os.geteuid() != 0:
+        err("This script must be run as root (or with sudo) on Linux.")
         sys.exit(1)
 
-    info(f"Running build.sh from {script_dir}…")
-    run(["bash", build_script, "all"], env={"GOPATH": os.path.expanduser("~/go")})
-    ok("Build complete. Binaries are in ./dist/")
 
-
-# ── Symlink installation ──────────────────────────────────────────────────────
-def _install_symlinks() -> None:
-    """Create /usr/local/bin symlinks for all-user access (including root).
-
-    NOTE: Mole is a Go project. Binaries must be built first with:
-        bash build.sh all
-    Binaries are expected in the dist/ subdirectory of the project root.
-    """
-    from pathlib import Path as _Path
-    import stat as _stat
-    app_dir = _Path(__file__).parent.resolve()
-    bin_dir = _Path("/usr/local/bin")
-
-    # (binary_relative_to_app_dir, symlink_name_in_bin_dir)
-    # Binaries are produced by `bash build.sh all` into dist/
-    LINKS = [
-        ("dist/mole-client", "mole-client"),
-        ("dist/mole-agent",  "mole-agent"),
-    ]
-
+def detect_os():
+    system = platform.system()
+    if system == "Darwin":
+        return "macos"
+    if system == "Windows":
+        return "windows"
+    # Linux — read /etc/os-release
+    os_release = {}
     try:
-        bin_dir.mkdir(parents=True, exist_ok=True)
-    except PermissionError:
-        warn("Cannot access /usr/local/bin — run as root to install symlinks.")
+        with open("/etc/os-release") as f:
+            for line in f:
+                line = line.strip()
+                if "=" in line:
+                    k, v = line.split("=", 1)
+                    os_release[k] = v.strip('"')
+    except FileNotFoundError:
+        pass
+    dist_id = os_release.get("ID", "").lower()
+    id_like  = os_release.get("ID_LIKE", "").lower()
+    if dist_id in ("kali", "ubuntu", "debian") or "debian" in id_like:
+        return "apt"
+    if dist_id in ("rhel", "centos", "rocky", "almalinux", "fedora") or "rhel" in id_like or "fedora" in id_like:
+        return "dnf"
+    if dist_id in ("sles", "opensuse", "opensuse-leap", "opensuse-tumbleweed") or "suse" in id_like:
+        return "zypper"
+    return "apt"   # fallback
+
+
+def go_current_version():
+    """Return (major, minor) tuple of installed go, or (0,0) if not found."""
+    go_bin = shutil.which("go") or str(GO_INSTALL / "bin" / "go")
+    try:
+        out = subprocess.check_output([go_bin, "version"],
+                                      stderr=subprocess.DEVNULL).decode()
+        # e.g. "go version go1.22.5 linux/amd64"
+        tok = [t for t in out.split() if t.startswith("go1.")]
+        if tok:
+            parts = tok[0].lstrip("go").split(".")
+            return (int(parts[0]), int(parts[1]))
+    except Exception:
+        pass
+    return (0, 0)
+
+
+def go_bin():
+    """Return path to go binary, preferring /usr/local/go/bin/go."""
+    local = GO_INSTALL / "bin" / "go"
+    if local.exists():
+        return str(local)
+    found = shutil.which("go")
+    return found or "go"
+
+
+# ─── phase: system packages ──────────────────────────────────────────────────
+
+def install_system_packages(os_type, args):
+    step("Phase 1 — System Packages")
+    if args.skip_apt:
+        warn("--skip-system set; skipping system package install.")
         return
 
-    for script_rel, link_name in LINKS:
-        script = app_dir / script_rel
-        link   = bin_dir / link_name
-        if not script.exists():
-            warn(f"Binary not found, skipping symlink: {script}  (run: bash build.sh all)")
-            continue
-        # Make binary executable
-        current = script.stat().st_mode
-        script.chmod(current | _stat.S_IXUSR | _stat.S_IXGRP | _stat.S_IXOTH)
-        # Create/replace symlink
-        if link.exists() or link.is_symlink():
-            link.unlink()
-        link.symlink_to(script)
-        ok(f"Symlink installed: {link}  →  {script}")
+    if os_type == "windows":
+        warn("Windows detected. Please install Go 1.22+, git, make, gcc manually.")
+        return
+
+    if os_type == "macos":
+        _brew_install(BREW_PKGS)
+        return
+
+    if os_type == "apt":
+        info("Running apt update + apt upgrade …")
+        run(["apt-get", "update", "-y"])
+        run(["apt-get", "upgrade", "-y"])
+        info("Installing APT packages …")
+        run(["apt-get", "install", "-y"] + APT_PKGS)
+
+    elif os_type == "dnf":
+        info("Installing DNF packages …")
+        run(["dnf", "install", "-y"] + DNF_PKGS)
+
+    elif os_type == "zypper":
+        info("Installing zypper packages …")
+        run(["zypper", "install", "-y"] + ZYPPER_PKGS)
 
 
-# ── Entry point ───────────────────────────────────────────────────────────────
-def main() -> None:
-    parser = argparse.ArgumentParser(
-        prog="install.py",
-        description=f"Mole installer v{VERSION} — installs build deps and builds Mole binaries.",
-    )
-    parser.add_argument(
-        "--deps-only",
-        action="store_true",
-        help="Install dependencies only; do not build binaries.",
-    )
-    parser.add_argument(
-        "--build-only",
-        action="store_true",
-        help="Skip dependency installation; build immediately.",
-    )
-    args = parser.parse_args()
-
-    print(_c("36", f"""
-╔══════════════════════════════════════════════════════╗
-║            Mole Installer  v{VERSION}                  ║
-║   SOCKS5 + DNS Transparent Proxy Suite               ║
-║   Platform: {SYSTEM:<43}║
-╚══════════════════════════════════════════════════════╝
-"""))
-
-    if not args.build_only:
-        if IS_LINUX:
-            install_linux()
-        elif IS_MACOS:
-            install_macos()
+def _brew_install(pkgs):
+    brew_path = shutil.which("brew")
+    if not brew_path:
+        warn("Homebrew not found; skipping brew installs.")
+        return
+    SUDO_USER = os.environ.get("SUDO_USER", "")
+    for pkg in pkgs:
+        if os.getuid() == 0:
+            if not SUDO_USER:
+                warn(f"Running as root with no SUDO_USER — cannot brew install {pkg}; skipping.")
+                continue
+            run(["sudo", "-u", SUDO_USER, brew_path, "install", pkg])
         else:
-            warn(f"Unsupported platform: {SYSTEM}. Attempting build anyway.")
+            run([brew_path, "install", pkg])
 
-    if not args.deps_only:
-        if not check_go_version():
-            error(
-                f"Go >= {MIN_GO_MAJOR}.{MIN_GO_MINOR} is required but not found on PATH.\n"
-                "  Linux:  Add /usr/local/go/bin to PATH, then re-run.\n"
-                "  macOS:  brew install go, then re-run."
-            )
-            sys.exit(1)
-        build()
 
-    _install_symlinks()
+# ─── Go version guard / tarball install ──────────────────────────────────────
 
-    print(_c("32", "\n[DONE]  Mole installation complete.\n"))
-    if not args.deps_only:
-        print("  Server: copy dist/moled_linux_amd64 to your proxy server and run:")
-        print("          sudo bash moled-install.sh")
-        print("  Client: copy dist/mole_<os>_<arch> to each client and run:")
-        print("          sudo ./mole --config config.yaml")
+def ensure_go_version(os_type):
+    """Verify go >= 1.22; download tarball if package manager gave an older version."""
+    step("Go Version Verification")
+    ver = go_current_version()
+    info(f"Detected Go version: {ver[0]}.{ver[1]}")
+    if ver >= GO_MIN:
+        info(f"Go {ver[0]}.{ver[1]} satisfies >= {GO_MIN[0]}.{GO_MIN[1]} ✓")
+        return
+
+    warn(f"Go {ver[0]}.{ver[1]} < {GO_MIN[0]}.{GO_MIN[1]}; downloading Go {GO_VERSION} tarball …")
+    if os_type == "windows":
+        err("Cannot auto-install Go tarball on Windows. Please install Go 1.22+ manually from https://go.dev/dl/")
+        sys.exit(1)
+
+    url = GO_MACOS if os_type == "macos" else GO_LINUX
+    tarball = Path(f"/tmp/go{GO_VERSION}.tar.gz")
+
+    info(f"Downloading {url} …")
+    urllib.request.urlretrieve(url, tarball)
+
+    if GO_INSTALL.exists():
+        info(f"Removing old {GO_INSTALL} …")
+        shutil.rmtree(GO_INSTALL)
+
+    info(f"Extracting to {GO_INSTALL.parent} …")
+    with tarfile.open(tarball, "r:gz") as tf:
+        tf.extractall(GO_INSTALL.parent)
+
+    tarball.unlink(missing_ok=True)
+
+    # Add to current process PATH so subsequent calls work
+    go_bin_dir = str(GO_INSTALL / "bin")
+    os.environ["PATH"] = go_bin_dir + ":" + os.environ.get("PATH", "")
+
+    ver = go_current_version()
+    if ver < GO_MIN:
+        err(f"Go version still {ver[0]}.{ver[1]} after tarball install. Aborting.")
+        sys.exit(1)
+    info(f"Go {ver[0]}.{ver[1]} installed successfully ✓")
+
+
+# ─── phase: pip ──────────────────────────────────────────────────────────────
+
+def install_pip_packages(args):
+    step("Phase 2 — Pip Packages")
+    if args.skip_pip:
+        warn("--skip-pip set; skipping.")
+        return
+    # Mole has no Python dependencies
+    info("Mole has no Python package dependencies — phase skipped.")
+
+
+# ─── phase: go (go.mod deps + go mod download) ───────────────────────────────
+
+def install_go_deps(args):
+    step("Phase 3 — Go Module Dependencies")
+    if args.skip_go:
+        warn("--skip-go set; skipping.")
+        return
+    if not APP_DIR.exists():
+        warn(f"{APP_DIR} not found; cannot run go mod download.")
+        return
+    gb = go_bin()
+    gopath = Path.home() / "go"
+    env = {**os.environ, "GOPATH": str(gopath), "PATH": str(GO_INSTALL / "bin") + ":" + os.environ.get("PATH", "")}
+    info("Running go mod download …")
+    try:
+        run([gb, "mod", "download"], cwd=APP_DIR, env=env)
+    except RuntimeError as exc:
+        warn(f"go mod download failed (non-fatal): {exc}")
+
+
+# ─── phase: git (build) ──────────────────────────────────────────────────────
+
+def build_app(args):
+    step("Phase 4 — Build (bash build.sh all)")
+    if args.skip_git:
+        warn("--skip-git set; skipping build.")
+        return
+    if not APP_DIR.exists():
+        err(f"App directory {APP_DIR} not found. Clone Mole first.")
+        sys.exit(1)
+    build_script = APP_DIR / "build.sh"
+    if not build_script.exists():
+        err(f"build.sh not found in {APP_DIR}.")
+        sys.exit(1)
+    gopath = Path.home() / "go"
+    env = {
+        **os.environ,
+        "GOPATH":   str(gopath),
+        "PATH":     str(GO_INSTALL / "bin") + ":" + os.environ.get("PATH", ""),
+        "HOME":     str(Path.home()),
+    }
+    info("Running bash build.sh all …")
+    run(["bash", "build.sh", "all"], cwd=APP_DIR, env=env)
+
+
+# ─── symlinks ────────────────────────────────────────────────────────────────
+
+def install_symlinks():
+    step("Creating Symlinks")
+    BIN_DIR.mkdir(parents=True, exist_ok=True)
+    for link_name, target in SYMLINKS.items():
+        link_path = BIN_DIR / link_name
+        if not target.exists():
+            warn(f"Target {target} not found; skipping symlink {link_name}.")
+            continue
+        if link_path.is_symlink() or link_path.exists():
+            link_path.unlink()
+        link_path.symlink_to(target)
+        info(f"Symlink: {link_path} → {target}")
+
+
+# ─── check mode ──────────────────────────────────────────────────────────────
+
+def run_check():
+    step("Check Mode — Dependency Status")
+    checks = {
+        "go":    shutil.which("go") or str(GO_INSTALL / "bin" / "go"),
+        "git":   shutil.which("git"),
+        "make":  shutil.which("make"),
+        "gcc":   shutil.which("gcc"),
+    }
+    all_ok = True
+    for name, path in checks.items():
+        if path and Path(path).exists():
+            info(f"{name:20s} {G}OK{W}  ({path})")
+        else:
+            err(f"{name:20s} {R}MISSING{W}")
+            all_ok = False
+
+    # Go version
+    ver = go_current_version()
+    if ver >= GO_MIN:
+        info(f"{'go version':20s} {G}OK{W}  ({ver[0]}.{ver[1]})")
+    else:
+        err(f"{'go version':20s} {R}INSUFFICIENT{W} ({ver[0]}.{ver[1]} < {GO_MIN[0]}.{GO_MIN[1]})")
+        all_ok = False
+
+    # Binaries after build
+    for name, target in SYMLINKS.items():
+        if target.exists():
+            info(f"{name:20s} {G}BUILT{W}  ({target})")
+        else:
+            warn(f"{name:20s} {Y}NOT BUILT{W}  ({target})")
+
+    print()
+    if all_ok:
+        info(f"{G}All checks passed.{W}")
+    else:
+        warn(f"{Y}Some checks failed — re-run without --check to install.{W}")
+    return all_ok
+
+
+# ─── post-install summary ─────────────────────────────────────────────────────
+
+def post_install_summary():
+    step("Post-Install Verification Summary")
+    results = []
+
+    # Go binary
+    gb = go_bin()
+    ver = go_current_version()
+    ok = ver >= GO_MIN
+    results.append(("go (>= 1.22)", ok, f"{ver[0]}.{ver[1]}" if ok else "missing/old"))
+
+    # git
+    ok = bool(shutil.which("git"))
+    results.append(("git", ok, shutil.which("git") or "missing"))
+
+    # Built binaries
+    for name, target in SYMLINKS.items():
+        ok = target.exists()
+        results.append((f"binary: {name}", ok, str(target) if ok else "not built"))
+
+    # Symlinks
+    for name in SYMLINKS:
+        link = BIN_DIR / name
+        ok = link.is_symlink()
+        results.append((f"symlink: {name}", ok, str(link) if ok else "missing"))
+
+    pad = max(len(r[0]) for r in results) + 2
+    print()
+    for label, ok, detail in results:
+        status = f"{G}OK{W}" if ok else f"{R}FAIL{W}"
+        print(f"  {label:<{pad}} {status}  {detail}")
+
+    failed = [r for r in results if not r[1]]
+    print()
+    if not failed:
+        info(f"{G}Mole installation complete and verified.{W}")
+    else:
+        warn(f"{Y}{len(failed)} item(s) need attention (see above).{W}")
+
+
+# ─── Windows note ─────────────────────────────────────────────────────────────
+
+def windows_note():
+    print(f"""
+{Y}[NOTE] Windows detected.{W}
+
+  Mole must be built manually on Windows:
+    1. Install Go 1.22+ from https://go.dev/dl/
+    2. Install Git from https://git-scm.com/
+    3. Clone the repo to a suitable directory.
+    4. Open a Developer Command Prompt and run:
+         go build ./...
+       or follow the project README for platform-specific build instructions.
+    5. Transparent TCP/DNS proxy features may require elevated privileges
+       and Windows Filtering Platform (WFP) instead of iptables.
+""")
+
+
+# ─── main ─────────────────────────────────────────────────────────────────────
+
+def parse_args():
+    p = argparse.ArgumentParser(
+        description=f"Installer for {APP_NAME}",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    p.add_argument("--skip-apt",    "--skip-system", dest="skip_apt",
+                   action="store_true", help="Skip system package installation")
+    p.add_argument("--skip-pip",    action="store_true",
+                   help="Skip pip package installation")
+    p.add_argument("--skip-go",     action="store_true",
+                   help="Skip Go module download step")
+    p.add_argument("--skip-git",    action="store_true",
+                   help="Skip build step")
+    p.add_argument("--check",       action="store_true",
+                   help="Check dependencies without installing")
+    return p.parse_args()
+
+
+def main():
+    banner()
+    args = parse_args()
+    os_type = detect_os()
+    info(f"Detected OS type: {os_type}")
+
+    if args.check:
+        ok = run_check()
+        sys.exit(0 if ok else 1)
+
+    if os_type == "windows":
+        windows_note()
+        sys.exit(0)
+
+    require_root()
+
+    # Phase 1 — system packages
+    install_system_packages(os_type, args)
+
+    # Go version guard (after package manager install)
+    if not args.skip_apt:
+        ensure_go_version(os_type)
+
+    # Phase 2 — pip (none for Mole)
+    install_pip_packages(args)
+
+    # Phase 3 — go mod download
+    install_go_deps(args)
+
+    # Phase 4 — build
+    build_app(args)
+
+    # Symlinks
+    install_symlinks()
+
+    # Summary
+    post_install_summary()
 
 
 if __name__ == "__main__":
