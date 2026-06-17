@@ -40,9 +40,10 @@ type ServerConfig struct {
 	} `yaml:"server"`
 
 	Auth struct {
-		Enabled  bool   `yaml:"enabled"`
-		Username string `yaml:"username"`
-		Password string `yaml:"password"`
+		Enabled   bool   `yaml:"enabled"`
+		Username  string `yaml:"username"`
+		Password  string `yaml:"password"`
+		VerifyURL string `yaml:"verify_url"` // §10.3 per-activation token callback
 	} `yaml:"auth"`
 
 	UpstreamDNS string `yaml:"upstream_dns"`
@@ -124,13 +125,18 @@ func main() {
 		DialTimeout: 30 * time.Second,
 	}
 	if cfg.Auth.Enabled {
-		if cfg.Auth.Username == "" || cfg.Auth.Password == "" {
-			log.Error("Auth is enabled but username or password is empty — refusing to start")
+		if cfg.Auth.VerifyURL != "" {
+			// §10.3 per-activation token callback (takes precedence over static).
+			s5.VerifyURL = cfg.Auth.VerifyURL
+			log.Info("SOCKS5 authentication: TOKEN-CALLBACK (%s)", cfg.Auth.VerifyURL)
+		} else if cfg.Auth.Username == "" || cfg.Auth.Password == "" {
+			log.Error("Auth is enabled but username/password (or verify_url) is empty — refusing to start")
 			os.Exit(1)
+		} else {
+			s5.Username = cfg.Auth.Username
+			s5.Password = cfg.Auth.Password
+			log.Info("SOCKS5 authentication: ENABLED (user=%s)", cfg.Auth.Username)
 		}
-		s5.Username = cfg.Auth.Username
-		s5.Password = cfg.Auth.Password
-		log.Info("SOCKS5 authentication: ENABLED (user=%s)", cfg.Auth.Username)
 	} else {
 		log.Info("SOCKS5 authentication: DISABLED (no auth required)")
 	}

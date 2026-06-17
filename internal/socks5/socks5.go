@@ -36,13 +36,13 @@ const (
 	atypIPv6   = 0x04
 
 	// Reply codes.
-	repSuccess        = 0x00
-	repGeneralFailure = 0x01
-	repNotAllowed     = 0x02
-	repNetUnreachable = 0x03
-	repHostUnreachable = 0x04
-	repConnRefused    = 0x05
-	repCmdNotSupported = 0x07
+	repSuccess          = 0x00
+	repGeneralFailure   = 0x01
+	repNotAllowed       = 0x02
+	repNetUnreachable   = 0x03
+	repHostUnreachable  = 0x04
+	repConnRefused      = 0x05
+	repCmdNotSupported  = 0x07
 	repAddrNotSupported = 0x08
 )
 
@@ -53,6 +53,13 @@ type Server struct {
 	Addr     string // "host:port" to listen on
 	Username string // empty = no authentication required
 	Password string
+
+	// VerifyURL enables per-activation TOKEN auth (§10.3): the RFC1929 password
+	// is treated as a Helm-issued token and validated by POSTing it to this URL
+	// (Helm broker /api/v1/mole/verify), cached 60 s. When set, it takes
+	// precedence over the static Username/Password; the username, if sent, must
+	// equal the codename the verify endpoint returns.
+	VerifyURL string
 
 	Log *logger.Logger
 
@@ -101,8 +108,8 @@ func (s *Server) handleConn(clientConn net.Conn) {
 		return
 	}
 
-	// ── Step 2: Authenticate (if username/password configured) ───────────
-	if s.Username != "" {
+	// ── Step 2: Authenticate (if static creds or token-callback configured) ──
+	if s.Username != "" || s.VerifyURL != "" {
 		if err := s.authenticateUser(clientConn, remote); err != nil {
 			s.Log.ConnError("SOCKS5 authentication failed from %s: %v", remote, err)
 			return
@@ -167,7 +174,7 @@ func (s *Server) negotiateAuth(conn net.Conn) error {
 
 	// Choose method.
 	chosen := byte(authNoAccept)
-	if s.Username == "" {
+	if s.Username == "" && s.VerifyURL == "" {
 		// Server requires no auth — accept if client also supports it.
 		for _, m := range methods {
 			if m == authNone {
@@ -222,6 +229,20 @@ func (s *Server) authenticateUser(conn net.Conn, remote string) error {
 	passwd := make([]byte, int(plenBuf[0]))
 	if _, err := io.ReadFull(conn, passwd); err != nil {
 		return fmt.Errorf("reading password: %w", err)
+	}
+
+	// Token-callback mode (§10.3): the password is a Helm-issued per-activation
+	// token; validate it via the verify endpoint (cached). The username, when
+	// present, must equal the codename the endpoint returns.
+	if s.VerifyURL != "" {
+		ok, codename := s.verifyToken(string(passwd))
+		if !ok || (len(uname) > 0 && string(uname) != codename) {
+			_, _ = conn.Write([]byte{0x01, 0x01})
+			return fmt.Errorf("token rejected for user %q from %s", string(uname), remote)
+		}
+		s.Log.Debug("SOCKS5 token accepted for codename %q from %s", codename, remote)
+		_, err := conn.Write([]byte{0x01, 0x00})
+		return err
 	}
 
 	if string(uname) != s.Username || string(passwd) != s.Password {
