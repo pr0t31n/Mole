@@ -175,7 +175,7 @@ func (c *Config) validate() error {
 		if s.Socks5Port <= 0 || s.Socks5Port > 65535 {
 			return fmt.Errorf("config: server[%d] has invalid socks5_port %d", i, s.Socks5Port)
 		}
-		if s.DNSPort <= 0 || s.DNSPort > 65535 {
+		if s.DNSPort < 0 || s.DNSPort > 65535 {
 			return fmt.Errorf("config: server[%d] has invalid dns_port %d", i, s.DNSPort)
 		}
 		if s.Name == "" {
