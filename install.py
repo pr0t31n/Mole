@@ -176,13 +176,26 @@ def install_system_packages(os_type, args):
         run(["zypper", "install", "-y"] + ZYPPER_PKGS)
 
 
+def _brew_installed_set():
+    try:
+        r = subprocess.run(["brew", "list", "--formula", "-1"],
+                           capture_output=True, text=True, check=True)
+        return set(r.stdout.strip().splitlines())
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        return set()
+
+
 def _brew_install(pkgs):
     brew_path = shutil.which("brew")
     if not brew_path:
         warn("Homebrew not found; skipping brew installs.")
         return
+    installed = _brew_installed_set()
     SUDO_USER = os.environ.get("SUDO_USER", "")
     for pkg in pkgs:
+        if pkg in installed:
+            info(f"  ✓ {pkg} already installed")
+            continue
         if os.getuid() == 0:
             if not SUDO_USER:
                 warn(f"Running as root with no SUDO_USER — cannot brew install {pkg}; skipping.")
