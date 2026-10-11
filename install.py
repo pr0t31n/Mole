@@ -61,6 +61,7 @@ def banner():
 
 def info(msg):  print(f"{G}[+]{W} {msg}")
 def warn(msg):  print(f"{Y}[!]{W} {msg}")
+def note(msg):  print(f"{Y}[i]{W} {msg}")
 def err(msg):   print(f"{R}[✗]{W} {msg}")
 def step(msg):  print(f"\n{B}━━ {msg} ━━{W}")
 
@@ -149,7 +150,7 @@ def go_bin():
 def install_system_packages(os_type, args):
     step("Phase 1 — System Packages")
     if args.skip_apt:
-        warn("--skip-system set; skipping system package install.")
+        note("--skip-system set; skipping system package install.")
         return
 
     if os_type == "windows":
@@ -188,7 +189,7 @@ def _brew_installed_set():
 def _brew_install(pkgs):
     brew_path = shutil.which("brew")
     if not brew_path:
-        warn("Homebrew not found; skipping brew installs.")
+        note("Homebrew not found; skipping brew installs.")
         return
     installed = _brew_installed_set()
     SUDO_USER = os.environ.get("SUDO_USER", "")
@@ -198,7 +199,7 @@ def _brew_install(pkgs):
             continue
         if os.getuid() == 0:
             if not SUDO_USER:
-                warn(f"Running as root with no SUDO_USER — cannot brew install {pkg}; skipping.")
+                note(f"Running as root with no SUDO_USER — cannot brew install {pkg}; skipping.")
                 continue
             run(["sudo", "-u", SUDO_USER, brew_path, "install", pkg])
         else:
@@ -253,7 +254,7 @@ def ensure_go_version(os_type):
 def install_pip_packages(args):
     step("Phase 2 — Pip Packages")
     if args.skip_pip:
-        warn("--skip-pip set; skipping.")
+        note("--skip-pip set; skipping.")
         return
     # Mole has no Python dependencies
     info("Mole has no Python package dependencies — phase skipped.")
@@ -264,7 +265,7 @@ def install_pip_packages(args):
 def install_go_deps(args):
     step("Phase 3 — Go Module Dependencies")
     if args.skip_go:
-        warn("--skip-go set; skipping.")
+        note("--skip-go set; skipping.")
         return
     if not APP_DIR.exists():
         warn(f"{APP_DIR} not found; cannot run go mod download.")
@@ -284,7 +285,7 @@ def install_go_deps(args):
 def build_app(args):
     step("Phase 4 — Build (bash build.sh all)")
     if args.skip_git:
-        warn("--skip-git set; skipping build.")
+        note("--skip-git set; skipping build.")
         return
     if not APP_DIR.exists():
         err(f"App directory {APP_DIR} not found. Clone Mole first.")
@@ -312,7 +313,7 @@ def install_symlinks():
     for link_name, target in SYMLINKS.items():
         link_path = BIN_DIR / link_name
         if not target.exists():
-            warn(f"Target {target} not found; skipping symlink {link_name}.")
+            note(f"Target {target} not found; skipping symlink {link_name}.")
             continue
         if link_path.is_symlink() or link_path.exists():
             link_path.unlink()
