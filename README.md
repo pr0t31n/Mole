@@ -7,6 +7,9 @@ Built for one specific scenario:
 
 ---
 
+
+> **[View full documentation on the Codex Wiki](https://wiki.pr0t31n.com/tools/mole)** — detailed features, CLI reference, findings catalogue, and integration guides.
+
 ## Architecture
 
 ```
