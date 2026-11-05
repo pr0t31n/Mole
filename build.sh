@@ -9,7 +9,7 @@
 # Output binaries are placed in ./dist/
 #
 # Cross-compilation targets:
-#   Linux   amd64 / arm64
+#   Linux   amd64 / arm64 / armv7 (Raspberry Pi, 32-bit ARM)
 #   macOS   amd64 / arm64 (Apple Silicon)
 #   Windows amd64
 # =============================================================================
@@ -30,14 +30,18 @@ fatal() { echo -e "${RED}[ERR]${NC}   $*" >&2; exit 1; }
 TARGET="${1:-all}"
 
 build_binary() {
-    local pkg="$1" name="$2" os="$3" arch="$4"
+    local pkg="$1" name="$2" os="$3" arch="$4" suffix="${5:-}"
     local ext=""
     [[ "${os}" == "windows" ]] && ext=".exe"
 
-    local out="${DIST}/${name}_${os}_${arch}${ext}"
+    local label="${suffix:-${arch}}"
+    local out="${DIST}/${name}_${os}_${label}${ext}"
     info "Building ${out}…"
 
-    GOOS="${os}" GOARCH="${arch}" go build \
+    local -a env_vars=("GOOS=${os}" "GOARCH=${arch}")
+    [[ "${suffix}" == "armv7" ]] && env_vars+=("GOARM=7")
+
+    env "${env_vars[@]}" go build \
         -trimpath \
         -ldflags="-s -w -X main.version=$(git describe --tags --always 2>/dev/null || echo 'dev')" \
         -o "${out}" \
@@ -50,6 +54,7 @@ build_server() {
     info "=== Building moled ==="
     build_binary ./cmd/server moled linux   amd64
     build_binary ./cmd/server moled linux   arm64
+    build_binary ./cmd/server moled linux   arm   armv7
     # macOS and Windows builds of the server are supported but not typical.
     # Uncomment if needed:
     # build_binary ./cmd/server moled darwin  amd64
@@ -60,6 +65,7 @@ build_client() {
     info "=== Building mole ==="
     build_binary ./cmd/client mole linux   amd64
     build_binary ./cmd/client mole linux   arm64
+    build_binary ./cmd/client mole linux   arm   armv7
     build_binary ./cmd/client mole darwin  amd64
     build_binary ./cmd/client mole darwin  arm64
     build_binary ./cmd/client mole windows amd64
