@@ -41,7 +41,7 @@ import (
 // version is the default version string, overridden at build time via:
 //   -ldflags="-X main.version=<tag>"
 // (see build.sh)
-var version = "1.0.0"
+var version = "1.1.6"
 
 func main() {
 	configPath := flag.String("config", "config.yaml", "Path to YAML configuration file")

@@ -146,9 +146,14 @@ func (m *Manager) applyIPTables() error {
 	// Flush any leftover rules from a previous (unclean) run.
 	m.flushChain()
 
-	// Create a dedicated NAT chain.
+	// Create a dedicated NAT chain. Tolerate "already exists" in case
+	// flushChain could not fully remove it (e.g. another reference).
 	if err := ipt("-t", "nat", "-N", chainName); err != nil {
-		return fmt.Errorf("create chain %s: %w", chainName, err)
+		if !strings.Contains(err.Error(), "Chain already exists") {
+			return fmt.Errorf("create chain %s: %w", chainName, err)
+		}
+		m.log.Warn("Platform (Linux): Chain %s survived cleanup (stale from crashed run); reusing", chainName)
+		_ = ipt("-t", "nat", "-F", chainName)
 	}
 
 	// ── Exclusion rules (traffic that goes DIRECT, not through proxy) ────
@@ -210,7 +215,12 @@ func (m *Manager) revertIPTables() {
 }
 
 func (m *Manager) flushChain() {
-	// Ignore errors — chain may not exist.
+	// Remove stale OUTPUT jump first — -X fails while the chain is referenced.
+	for {
+		if err := ipt("-t", "nat", "-D", "OUTPUT", "-j", chainName); err != nil {
+			break
+		}
+	}
 	_ = ipt("-t", "nat", "-F", chainName)
 	_ = ipt("-t", "nat", "-X", chainName)
 }
