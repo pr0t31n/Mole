@@ -18,6 +18,7 @@ import (
 	"encoding/binary"
 	"fmt"
 	"net"
+	"sync"
 	"syscall"
 	"time"
 	"unsafe"
@@ -43,6 +44,12 @@ type Proxy struct {
 	Log        *logger.Logger
 	DialTimeout time.Duration
 
+	// Callbacks for the connector — all optional.
+	OnConnOpen  func() // called when a tunnel connection opens
+	OnConnClose func() // called when a tunnel connection closes
+	OnDialFail  func() // called when SOCKS5 dial to the upstream server fails
+
+	serverMu sync.RWMutex
 	ln       net.Listener
 	stopChan chan struct{}
 }
@@ -78,10 +85,18 @@ func (p *Proxy) Stop() {
 	p.Log.Info("Transparent proxy stopped")
 }
 
-// UpdateServer switches to a new upstream proxy server.
+// UpdateServer switches to a new upstream proxy server (thread-safe).
 func (p *Proxy) UpdateServer(srv config.ServerEntry) {
+	p.serverMu.Lock()
 	p.Server = srv
+	p.serverMu.Unlock()
 	p.Log.Info("Transparent proxy switched to server %s (%s)", srv.Name, srv.Socks5Addr())
+}
+
+func (p *Proxy) currentServer() config.ServerEntry {
+	p.serverMu.RLock()
+	defer p.serverMu.RUnlock()
+	return p.Server
 }
 
 // ─── Accept loop ──────────────────────────────────────────────────────────
@@ -105,7 +120,15 @@ func (p *Proxy) serve() {
 // ─── Per-connection handler ───────────────────────────────────────────────
 
 func (p *Proxy) handleConn(clientConn *net.TCPConn) {
-	defer clientConn.Close()
+	if p.OnConnOpen != nil {
+		p.OnConnOpen()
+	}
+	defer func() {
+		if p.OnConnClose != nil {
+			p.OnConnClose()
+		}
+		clientConn.Close()
+	}()
 
 	// ── Recover original destination via SO_ORIGINAL_DST ─────────────────
 	origDst, err := getOriginalDst(clientConn)
@@ -116,6 +139,7 @@ func (p *Proxy) handleConn(clientConn *net.TCPConn) {
 	}
 
 	src := clientConn.RemoteAddr().String()
+	srv := p.currentServer()
 	p.Log.Debug("Transparent proxy: intercepted %s → %s", src, origDst)
 
 	// ── Dial through SOCKS5 to original destination ───────────────────────
@@ -124,18 +148,24 @@ func (p *Proxy) handleConn(clientConn *net.TCPConn) {
 		auth = &proxy.Auth{User: p.Auth.Username, Password: p.Auth.Password}
 	}
 
-	dialer, err := proxy.SOCKS5("tcp", p.Server.Socks5Addr(), auth, &net.Dialer{
+	dialer, err := proxy.SOCKS5("tcp", srv.Socks5Addr(), auth, &net.Dialer{
 		Timeout: p.DialTimeout,
 	})
 	if err != nil {
 		p.Log.Error("Transparent proxy: create SOCKS5 dialer: %v", err)
+		if p.OnDialFail != nil {
+			p.OnDialFail()
+		}
 		return
 	}
 
 	targetConn, err := dialer.Dial("tcp", origDst)
 	if err != nil {
 		p.Log.Error("Transparent proxy: SOCKS5 dial to %s via %s: %v",
-			origDst, p.Server.Socks5Addr(), err)
+			origDst, srv.Socks5Addr(), err)
+		if p.OnDialFail != nil {
+			p.OnDialFail()
+		}
 		return
 	}
 	defer targetConn.Close()

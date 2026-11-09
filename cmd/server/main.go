@@ -1,4 +1,4 @@
-// moled: SOCKS5 + DNS proxy server.
+// moled: SOCKS5 + DNS proxy server with health checking.
 //
 // Usage:
 //
@@ -8,6 +8,12 @@
 //   - A SOCKS5 proxy on the configured port (default 1080)
 //   - A DNS proxy on the configured port (default 5353) for TCP DNS-over-TCP
 //     connections from tunnelled clients, plus UDP for direct queries.
+//
+// Health checking:
+//   When enabled, the server periodically probes critical endpoints (internet,
+//   GitHub, apt/brew). If probes fail, all client connections are killed and
+//   new connections are rejected until health is restored. This forces clients
+//   to fail over to a healthy server.
 //
 // All connections and disconnections are logged to the connection log.
 // Errors are logged to the error log.
@@ -19,12 +25,14 @@ import (
 	"fmt"
 	"os"
 	"os/signal"
+	"sync/atomic"
 	"syscall"
 	"time"
 
 	"gopkg.in/yaml.v3"
 
 	"github.com/mole/internal/dnsproxy"
+	"github.com/mole/internal/health"
 	"github.com/mole/internal/logger"
 	"github.com/mole/internal/socks5"
 )
@@ -48,6 +56,25 @@ type ServerConfig struct {
 
 	UpstreamDNS string `yaml:"upstream_dns"`
 
+	HealthCheck struct {
+		// Enabled turns on periodic health checking. When a check fails,
+		// all client connections are killed and new ones are rejected.
+		Enabled bool `yaml:"enabled"`
+
+		// IntervalMin is how often (in minutes) to run health checks.
+		// Default: 90 (1.5 hours).
+		IntervalMin int `yaml:"interval_min"`
+
+		// TimeoutSec is the TCP connect timeout for each probe.
+		// Default: 10.
+		TimeoutSec int `yaml:"timeout_sec"`
+
+		// Targets is an optional list of additional "host:port" endpoints
+		// to probe. The default set (internet, GitHub, apt, Kali, brew)
+		// is always included.
+		Targets []string `yaml:"targets"`
+	} `yaml:"health_check"`
+
 	Logging struct {
 		Dir                  string `yaml:"dir"`
 		Verbose              bool   `yaml:"verbose"`
@@ -62,6 +89,9 @@ func defaultServerConfig() *ServerConfig {
 	cfg.Server.Socks5Port = 1080
 	cfg.Server.DNSPort = 5353
 	cfg.UpstreamDNS = "1.1.1.1:53"
+	cfg.HealthCheck.Enabled = true
+	cfg.HealthCheck.IntervalMin = 90
+	cfg.HealthCheck.TimeoutSec = 10
 	cfg.Logging.Dir = "/var/log/mole"
 	cfg.Logging.Verbose = true
 	cfg.Logging.ConnectionRetainDays = 90
@@ -109,6 +139,7 @@ func main() {
 	log.Info("  Bind address : %s", cfg.Server.BindAddress)
 	log.Info("  Upstream DNS : %s", cfg.UpstreamDNS)
 	log.Info("  Auth enabled : %v", cfg.Auth.Enabled)
+	log.Info("  Health check : %v (interval: %dm)", cfg.HealthCheck.Enabled, healthInterval(cfg))
 	log.Info("  Log dir      : %s", cfg.Logging.Dir)
 	log.Info("  Conn retain  : %d days", cfg.Logging.ConnectionRetainDays)
 	log.Info("  Err retain   : %d days", cfg.Logging.ErrorRetainDays)
@@ -118,11 +149,16 @@ func main() {
 	socks5Addr := fmt.Sprintf("%s:%d", cfg.Server.BindAddress, cfg.Server.Socks5Port)
 	dnsAddr := fmt.Sprintf("%s:%d", cfg.Server.BindAddress, cfg.Server.DNSPort)
 
+	// ── Shared health state ───────────────────────────────────────────────
+	var healthy atomic.Bool
+	healthy.Store(true)
+
 	// ── Start SOCKS5 server ───────────────────────────────────────────────
 	s5 := &socks5.Server{
 		Addr:        socks5Addr,
 		Log:         log,
 		DialTimeout: 30 * time.Second,
+		Healthy:     &healthy,
 	}
 	if cfg.Auth.Enabled {
 		if cfg.Auth.VerifyURL != "" {
@@ -162,6 +198,33 @@ func main() {
 		}
 	}()
 
+	// ── Start health checker ──────────────────────────────────────────────
+	var hc *health.Checker
+	if cfg.HealthCheck.Enabled {
+		targets := health.DefaultTargets()
+		for _, t := range cfg.HealthCheck.Targets {
+			targets = append(targets, health.Target{
+				Name:     t,
+				Addr:     t,
+				Critical: false,
+			})
+		}
+
+		interval := time.Duration(healthInterval(cfg)) * time.Minute
+		timeout := time.Duration(healthTimeout(cfg)) * time.Second
+
+		hc = health.NewChecker(targets, interval, timeout, log)
+		hc.OnUnhealthy = func() {
+			s5.KillAllConns()
+		}
+		hc.OnHealthy = func() {
+			log.Info("Health restored — SOCKS5 server accepting connections again")
+		}
+
+		go hc.Run()
+		log.Info("Health checker started: %d target(s), every %v", len(targets), interval)
+	}
+
 	log.Info("Server ready. Waiting for connections…")
 
 	// ── Wait for shutdown signal ──────────────────────────────────────────
@@ -170,5 +233,24 @@ func main() {
 	sig := <-sigCh
 
 	log.Info("Received signal %v — shutting down gracefully…", sig)
+	if hc != nil {
+		hc.Stop()
+	}
 	log.Info("Mole Server stopped at %s UTC", time.Now().UTC().Format("2006-01-02 15:04:05"))
+}
+
+// ─── Helpers ─────────────────────────────────────────────────────────────
+
+func healthInterval(cfg *ServerConfig) int {
+	if cfg.HealthCheck.IntervalMin <= 0 {
+		return 90
+	}
+	return cfg.HealthCheck.IntervalMin
+}
+
+func healthTimeout(cfg *ServerConfig) int {
+	if cfg.HealthCheck.TimeoutSec <= 0 {
+		return 10
+	}
+	return cfg.HealthCheck.TimeoutSec
 }

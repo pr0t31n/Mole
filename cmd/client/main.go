@@ -1,4 +1,4 @@
-// mole: transparent SOCKS5 + DNS proxy client.
+// mole: transparent SOCKS5 + DNS proxy client with automatic failover.
 //
 // Usage:
 //
@@ -11,37 +11,36 @@
 //
 // What it does:
 //  1. Loads configuration from YAML.
-//  2. Tries each server in order until one passes a live SOCKS5 probe.
-//  3. Starts a local DNS proxy (127.0.0.1:53) that tunnels queries via SOCKS5.
-//  4. Starts a local transparent TCP proxy (Linux: SO_ORIGINAL_DST via iptables).
-//  5. Applies platform-specific routing (iptables/networksetup/netsh).
-//  6. On SIGINT/SIGTERM, reverts all changes and exits cleanly.
+//  2. Probes all enabled servers concurrently, ranking by priority then speed.
+//  3. Selects the best server and starts local DNS + transparent TCP proxies.
+//  4. Applies platform-specific routing (iptables/networksetup/netsh).
+//  5. Monitors the active server; fails over automatically on connection loss.
+//  6. Periodically re-evaluates servers and switches to a higher-priority one
+//     when safe (no active tunnel connections).
+//  7. On SIGINT/SIGTERM, reverts all changes and exits cleanly.
 package main
 
 import (
 	"flag"
 	"fmt"
-	"net"
 	"os"
 	"os/signal"
 	"runtime"
 	"syscall"
 	"time"
 
-	// golang.org/x/net/proxy — SOCKS5 dialer by The Go Authors / Google (https://pkg.go.dev/golang.org/x/net/proxy)
-	"golang.org/x/net/proxy"
-
 	"github.com/mole/internal/config"
-	"github.com/mole/internal/dnsproxy"
+	"github.com/mole/internal/connector"
 	"github.com/mole/internal/logger"
 	"github.com/mole/internal/platform"
 	"github.com/mole/internal/transparent"
+	"github.com/mole/internal/dnsproxy"
 )
 
 // version is the default version string, overridden at build time via:
 //   -ldflags="-X main.version=<tag>"
 // (see build.sh)
-var version = "1.1.6"
+var version = "1.2.0"
 
 func main() {
 	configPath := flag.String("config", "config.yaml", "Path to YAML configuration file")
@@ -69,26 +68,38 @@ func main() {
 	log.Info("  Mole Client  v%s  —  %s UTC", version, time.Now().UTC().Format("2006-01-02 15:04:05"))
 	log.Info("  Platform : %s/%s", runtime.GOOS, runtime.GOARCH)
 	log.Info("  Config   : %s", *configPath)
-	log.Info("  Servers  : %d configured", len(cfg.Servers))
+	log.Info("  Servers  : %d configured (%d enabled)", len(cfg.Servers), len(cfg.EnabledServers()))
 	for i, s := range cfg.Servers {
-		log.Info("    [%d] %s  →  %s", i+1, s.Name, s.Socks5Addr())
+		pri := "default"
+		if s.Priority != nil {
+			if *s.Priority == 0 {
+				pri = "DISABLED"
+			} else {
+				pri = fmt.Sprintf("P%d", *s.Priority)
+			}
+		}
+		log.Info("    [%d] %s  →  %s  (%s)", i+1, s.Name, s.Socks5Addr(), pri)
 	}
 	log.Info("══════════════════════════════════════════════════════════")
 
+	// ── Create connector ──────────────────────────────────────────────────
+	conn := connector.New(cfg, log)
+
 	// ── Check mode: probe all servers and exit ────────────────────────────
 	if *checkMode {
-		runCheckMode(cfg, log)
+		runCheckMode(conn, cfg, log)
 		return
 	}
 
-	// ── Find a working server (tries in order with retries) ───────────────
-	activeServer, err := findWorkingServer(cfg, log)
+	// ── Select best server (probes all concurrently) ─────────────────────
+	activeServer, err := conn.InitialSelect()
 	if err != nil {
 		log.Error("FATAL: %v", err)
 		log.Error("Ensure the VPN is active and at least one proxy server is running.")
 		os.Exit(1)
 	}
-	log.Info("Active server selected: %s  (%s)", activeServer.Name, activeServer.Socks5Addr())
+	log.Info("Active server selected: %s  (%s)  [P%d]",
+		activeServer.Name, activeServer.Socks5Addr(), activeServer.EffectivePriority())
 
 	// ── Start local DNS proxy ─────────────────────────────────────────────
 	dnsListenAddr := fmt.Sprintf("127.0.0.1:%d", cfg.Local.DNSPort)
@@ -99,6 +110,7 @@ func main() {
 		UpstreamDNS:  cfg.DNS.UpstreamDNS,
 		Log:          log,
 		QueryTimeout: 10 * time.Second,
+		OnDialFail:   func() { conn.ReportDialFailure() },
 	}
 	if err := dnsProxy.Start(); err != nil {
 		log.Error("FATAL: DNS proxy failed to start on %s: %v", dnsListenAddr, err)
@@ -118,6 +130,9 @@ func main() {
 		Auth:        cfg.Auth,
 		Log:         log,
 		DialTimeout: cfg.ConnectTimeout(),
+		OnConnOpen:  func() { conn.IncrConns() },
+		OnConnClose: func() { conn.DecrConns() },
+		OnDialFail:  func() { conn.ReportDialFailure() },
 	}
 	if err := tProxy.Start(); err != nil {
 		log.Error("FATAL: Transparent proxy failed to start on %s: %v", tpListenAddr, err)
@@ -125,6 +140,12 @@ func main() {
 		os.Exit(1)
 	}
 	defer tProxy.Stop()
+
+	// ── Register server-switch callbacks ──────────────────────────────────
+	conn.OnServerSwitch(func(srv config.ServerEntry) {
+		tProxy.UpdateServer(srv)
+		dnsProxy.UpdateServer(srv)
+	})
 
 	// ── Apply platform routing & DNS override ─────────────────────────────
 	ps := platform.Setup{
@@ -144,12 +165,18 @@ func main() {
 	// Platform revert is always called, even on panic.
 	defer mgr.Revert()
 
+	// ── Start background loops ────────────────────────────────────────────
+	go conn.RunFailoverLoop()
+	go conn.RunHealthCheckLoop()
+
 	// ── Ready banner ──────────────────────────────────────────────────────
 	log.Info("══════════════════════════════════════════════════════════")
 	log.Info("  Mole Client ACTIVE")
-	log.Info("  Server      : %s  (%s)", activeServer.Name, activeServer.Socks5Addr())
+	log.Info("  Server      : %s  (%s)  [P%d]", activeServer.Name, activeServer.Socks5Addr(), activeServer.EffectivePriority())
 	log.Info("  DNS proxy   : %s  →  %s  (via SOCKS5)", dnsListenAddr, cfg.DNS.UpstreamDNS)
 	log.Info("  TCP proxy   : %s  (transparent intercept)", tpListenAddr)
+	log.Info("  Failover    : automatic (3 failures in 30s triggers switch)")
+	log.Info("  Health check: every %v", cfg.HealthCheckInterval())
 	log.Info("  Press Ctrl+C to disconnect and restore all system settings.")
 	log.Info("══════════════════════════════════════════════════════════")
 
@@ -160,101 +187,57 @@ func main() {
 
 	log.Info("")
 	log.Info("Signal received: %v — initiating clean shutdown…", sig)
+	conn.Stop()
 	// Deferred calls handle revert, tProxy.Stop(), dnsProxy.Stop()
 	log.Info("All system settings restored. Mole Client stopped at %s UTC.",
 		time.Now().UTC().Format("2006-01-02 15:04:05"))
 }
 
-// ─── Server selection ─────────────────────────────────────────────────────
-
-// findWorkingServer iterates the configured server list in order, retrying
-// each one up to RetryAttempts times.  Returns the first server that passes
-// a live SOCKS5 connectivity probe.
-func findWorkingServer(cfg *config.Config, log *logger.Logger) (config.ServerEntry, error) {
-	log.Info("Probing %d configured server(s) — trying in order…", len(cfg.Servers))
-
-	for idx, srv := range cfg.Servers {
-		log.Info("[%d/%d] Probing: %s  (%s)…", idx+1, len(cfg.Servers), srv.Name, srv.Socks5Addr())
-
-		var lastErr error
-		for attempt := 1; attempt <= cfg.RetryAttempts(); attempt++ {
-			if attempt > 1 {
-				log.Info("  → Retry %d/%d in %v…", attempt, cfg.RetryAttempts(), cfg.RetryDelay())
-				time.Sleep(cfg.RetryDelay())
-			}
-
-			if err := probeServer(srv, cfg); err != nil {
-				lastErr = err
-				log.Warn("  → Attempt %d/%d failed: %v", attempt, cfg.RetryAttempts(), err)
-				continue
-			}
-
-			log.Info("  → SUCCESS — server is reachable ✓")
-			return srv, nil
-		}
-
-		log.Warn("[%d/%d] FAILED: %s — all %d attempt(s) exhausted: %v",
-			idx+1, len(cfg.Servers), srv.Name, cfg.RetryAttempts(), lastErr)
-	}
-
-	return config.ServerEntry{}, fmt.Errorf(
-		"all %d server(s) unreachable — check VPN connection and server status",
-		len(cfg.Servers),
-	)
-}
-
-// probeServer dials the SOCKS5 server and issues a CONNECT to 1.1.1.1:80
-// to verify end-to-end tunnelling is working.
-func probeServer(srv config.ServerEntry, cfg *config.Config) error {
-	var auth *proxy.Auth
-	if cfg.Auth.Username != "" {
-		auth = &proxy.Auth{User: cfg.Auth.Username, Password: cfg.Auth.Password}
-	}
-
-	dialer, err := proxy.SOCKS5("tcp", srv.Socks5Addr(), auth, &net.Dialer{
-		Timeout: cfg.ConnectTimeout(),
-	})
-	if err != nil {
-		return fmt.Errorf("build SOCKS5 dialer: %w", err)
-	}
-
-	// 1.1.1.1:80 is Cloudflare's DNS-over-HTTP — highly reliable, always up.
-	conn, err := dialer.Dial("tcp", "1.1.1.1:80")
-	if err != nil {
-		return fmt.Errorf("SOCKS5 CONNECT to 1.1.1.1:80 via %s: %w", srv.Socks5Addr(), err)
-	}
-	_ = conn.Close()
-	return nil
-}
-
 // ─── Check mode ───────────────────────────────────────────────────────────
 
-func runCheckMode(cfg *config.Config, log *logger.Logger) {
-	log.Info("Check mode: probing all %d configured server(s)…", len(cfg.Servers))
+func runCheckMode(conn *connector.Connector, cfg *config.Config, log *logger.Logger) {
+	log.Info("Check mode: probing all %d configured server(s) concurrently…", len(cfg.Servers))
 	log.Info("")
 
+	// Show disabled servers.
+	for _, srv := range cfg.Servers {
+		if !srv.IsEnabled() {
+			log.Info("[--] %s", srv.Name)
+			log.Info("       SOCKS5 : %s", srv.Socks5Addr())
+			log.Info("       DNS    : %s", srv.DNSAddr())
+			log.Info("       Status : DISABLED (priority=0)")
+			log.Info("")
+		}
+	}
+
+	statuses := conn.ProbeAll()
+
 	allOK := true
-	for i, srv := range cfg.Servers {
-		log.Info("[%d/%d] %s", i+1, len(cfg.Servers), srv.Name)
-		log.Info("       SOCKS5: %s", srv.Socks5Addr())
-		log.Info("       DNS   : %s", srv.DNSAddr())
+	for i, s := range statuses {
+		log.Info("[%d/%d] %s", i+1, len(statuses), s.Server.Name)
+		log.Info("       SOCKS5  : %s", s.Server.Socks5Addr())
+		log.Info("       DNS     : %s", s.Server.DNSAddr())
+		log.Info("       Priority: %d", s.Server.EffectivePriority())
 
-		start := time.Now()
-		err := probeServer(srv, cfg)
-		elapsed := time.Since(start).Round(time.Millisecond)
-
-		if err != nil {
-			log.Error("       Status: UNREACHABLE  (%v elapsed)", elapsed)
-			log.Error("       Reason: %v", err)
-			allOK = false
+		if s.Alive {
+			log.Info("       Status  : REACHABLE ✓  (%v)", s.Latency.Round(time.Millisecond))
 		} else {
-			log.Info("       Status: REACHABLE ✓  (%v elapsed)", elapsed)
+			log.Error("       Status  : UNREACHABLE")
+			allOK = false
 		}
 		log.Info("")
 	}
 
+	// Show what would be selected.
+	best, err := connector.SelectBest(statuses)
+	if err == nil {
+		log.Info("Best server: %s  (P%d, latency %v)",
+			best.Server.Name, best.Server.EffectivePriority(),
+			best.Latency.Round(time.Millisecond))
+	}
+
 	if allOK {
-		log.Info("All servers reachable.")
+		log.Info("All enabled servers reachable.")
 		os.Exit(0)
 	} else {
 		log.Error("One or more servers unreachable.")

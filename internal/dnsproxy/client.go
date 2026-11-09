@@ -17,6 +17,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"sync"
 	"time"
 
 	"golang.org/x/net/proxy"
@@ -44,6 +45,10 @@ type ClientProxy struct {
 
 	QueryTimeout time.Duration
 
+	// OnDialFail is called when a SOCKS5 dial to the upstream server fails.
+	OnDialFail func()
+
+	serverMu sync.RWMutex
 	conn     net.PacketConn
 	stopChan chan struct{}
 }
@@ -79,10 +84,18 @@ func (p *ClientProxy) Stop() {
 	p.Log.Info("DNS client proxy stopped")
 }
 
-// UpdateServer switches to a new proxy server without restarting the listener.
+// UpdateServer switches to a new proxy server without restarting the listener (thread-safe).
 func (p *ClientProxy) UpdateServer(srv config.ServerEntry) {
+	p.serverMu.Lock()
 	p.Server = srv
+	p.serverMu.Unlock()
 	p.Log.Info("DNS client proxy switched to server %s (%s)", srv.Name, srv.Socks5Addr())
+}
+
+func (p *ClientProxy) currentServer() config.ServerEntry {
+	p.serverMu.RLock()
+	defer p.serverMu.RUnlock()
+	return p.Server
 }
 
 // ─── Internal serving loop ────────────────────────────────────────────────
@@ -125,22 +138,30 @@ func (p *ClientProxy) handleQuery(src net.Addr, raw []byte) {
 
 // tunnelQuery sends a DNS query through the SOCKS5 tunnel and returns the raw response.
 func (p *ClientProxy) tunnelQuery(raw []byte) ([]byte, error) {
+	srv := p.currentServer()
+
 	// Build SOCKS5 dialer.
 	var auth *proxy.Auth
 	if p.Auth.Username != "" {
 		auth = &proxy.Auth{User: p.Auth.Username, Password: p.Auth.Password}
 	}
 
-	dialer, err := proxy.SOCKS5("tcp", p.Server.Socks5Addr(), auth, proxy.Direct)
+	dialer, err := proxy.SOCKS5("tcp", srv.Socks5Addr(), auth, proxy.Direct)
 	if err != nil {
+		if p.OnDialFail != nil {
+			p.OnDialFail()
+		}
 		return nil, fmt.Errorf("create SOCKS5 dialer: %w", err)
 	}
 
 	// Connect through SOCKS5 to the upstream DNS server.
 	conn, err := dialer.Dial("tcp", p.UpstreamDNS)
 	if err != nil {
+		if p.OnDialFail != nil {
+			p.OnDialFail()
+		}
 		return nil, fmt.Errorf("SOCKS5 dial to upstream DNS %s via %s: %w",
-			p.UpstreamDNS, p.Server.Socks5Addr(), err)
+			p.UpstreamDNS, srv.Socks5Addr(), err)
 	}
 	defer conn.Close()
 	_ = conn.SetDeadline(time.Now().Add(p.QueryTimeout))

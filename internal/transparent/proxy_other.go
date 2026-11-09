@@ -27,6 +27,11 @@ type Proxy struct {
 	Auth        config.AuthConfig
 	Log         *logger.Logger
 	DialTimeout time.Duration
+
+	// Callbacks — present for API compatibility, never fired on non-Linux.
+	OnConnOpen  func()
+	OnConnClose func()
+	OnDialFail  func()
 }
 
 // Start logs an informational notice on non-Linux platforms.

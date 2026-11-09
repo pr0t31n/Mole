@@ -5,6 +5,8 @@
 //   - CONNECT command (TCP tunnelling)
 //   - IPv4, IPv6, and domain-name address types
 //   - Per-connection goroutines for concurrent handling
+//   - Health gate: reject new connections when server is unhealthy
+//   - Connection tracking: kill all active connections on demand
 package socks5
 
 import (
@@ -12,6 +14,8 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/mole/internal/logger"
@@ -65,6 +69,51 @@ type Server struct {
 
 	// DialTimeout is applied when connecting to the target host.
 	DialTimeout time.Duration
+
+	// Healthy gates new connections. When non-nil and storing false, new
+	// connections are immediately rejected with repNotAllowed. When nil the
+	// gate is always open (backward-compatible default).
+	Healthy *atomic.Bool
+
+	// Connection tracking for kill-all.
+	connsMu sync.Mutex
+	conns   map[net.Conn]struct{}
+}
+
+func (s *Server) trackConn(c net.Conn) {
+	s.connsMu.Lock()
+	if s.conns == nil {
+		s.conns = make(map[net.Conn]struct{})
+	}
+	s.conns[c] = struct{}{}
+	s.connsMu.Unlock()
+}
+
+func (s *Server) untrackConn(c net.Conn) {
+	s.connsMu.Lock()
+	delete(s.conns, c)
+	s.connsMu.Unlock()
+}
+
+// KillAllConns forcefully closes every tracked connection.
+func (s *Server) KillAllConns() {
+	s.connsMu.Lock()
+	count := len(s.conns)
+	for c := range s.conns {
+		_ = c.Close()
+	}
+	s.conns = make(map[net.Conn]struct{})
+	s.connsMu.Unlock()
+	if count > 0 {
+		s.Log.Info("SOCKS5: killed %d active connection(s)", count)
+	}
+}
+
+// ActiveConnCount returns how many connections are tracked.
+func (s *Server) ActiveConnCount() int {
+	s.connsMu.Lock()
+	defer s.connsMu.Unlock()
+	return len(s.conns)
 }
 
 // ListenAndServe starts accepting connections.  It blocks until an error occurs.
@@ -88,6 +137,15 @@ func (s *Server) ListenAndServe() error {
 			s.Log.Error("SOCKS5 accept error: %v", err)
 			return err
 		}
+
+		// Health gate: reject immediately when unhealthy.
+		if s.Healthy != nil && !s.Healthy.Load() {
+			s.Log.Conn("SOCKS5 rejecting connection from %s — server unhealthy",
+				conn.RemoteAddr())
+			_ = conn.Close()
+			continue
+		}
+
 		go s.handleConn(conn)
 	}
 }
@@ -95,7 +153,11 @@ func (s *Server) ListenAndServe() error {
 // ─── Connection handler ───────────────────────────────────────────────────
 
 func (s *Server) handleConn(clientConn net.Conn) {
-	defer clientConn.Close()
+	s.trackConn(clientConn)
+	defer func() {
+		s.untrackConn(clientConn)
+		clientConn.Close()
+	}()
 
 	remote := clientConn.RemoteAddr().String()
 	s.Log.Conn("SOCKS5 new connection from %s", remote)
@@ -134,7 +196,11 @@ func (s *Server) handleConn(clientConn net.Conn) {
 		s.sendReply(clientConn, mapDialError(err), nil)
 		return
 	}
-	defer targetConn.Close()
+	s.trackConn(targetConn)
+	defer func() {
+		s.untrackConn(targetConn)
+		targetConn.Close()
+	}()
 
 	// Reply with success and the bound address.
 	if err := s.sendReply(clientConn, repSuccess, targetConn.LocalAddr()); err != nil {

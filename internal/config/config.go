@@ -27,6 +27,29 @@ type ServerEntry struct {
 	Host      string `yaml:"host"`       // IP address or hostname of the proxy server.
 	Socks5Port int   `yaml:"socks5_port"` // Port the SOCKS5 server listens on.
 	DNSPort   int   `yaml:"dns_port"`   // Port the server's DNS proxy listens on (TCP).
+
+	// Priority controls server selection order.
+	//   nil (omitted) = active, default tier (treated as priority 2)
+	//   0             = disabled / do not use
+	//   1             = highest priority
+	//   2             = medium priority
+	//   3             = lowest priority
+	// Within the same priority tier, servers are ranked by measured latency.
+	Priority *int `yaml:"priority,omitempty"`
+}
+
+// EffectivePriority returns the server's selection tier (1–3).
+// Nil (unset) defaults to 2; disabled (0) returns 0.
+func (s ServerEntry) EffectivePriority() int {
+	if s.Priority == nil {
+		return 2
+	}
+	return *s.Priority
+}
+
+// IsEnabled returns true if the server participates in selection.
+func (s ServerEntry) IsEnabled() bool {
+	return s.Priority == nil || *s.Priority > 0
 }
 
 // AuthConfig holds optional SOCKS5 username/password credentials.
@@ -55,6 +78,11 @@ type NetworkConfig struct {
 
 	// RetryDelaySec is how many seconds to wait between retry attempts.
 	RetryDelaySec int `yaml:"retry_delay_sec"`
+
+	// HealthCheckIntervalMin is how often (in minutes) to re-evaluate server
+	// availability and potentially switch to a higher-priority server.
+	// Default: 90 (1.5 hours). Set 0 to disable periodic health checks.
+	HealthCheckIntervalMin int `yaml:"health_check_interval_min"`
 }
 
 // DNSConfig configures DNS behaviour on the client.
@@ -95,6 +123,18 @@ func (c *Config) RetryDelay() time.Duration {
 	return time.Duration(c.Network.RetryDelaySec) * time.Second
 }
 
+// HealthCheckInterval returns the periodic health check interval.
+// Returns 0 (disabled) when explicitly set to 0; default is 90 minutes.
+func (c *Config) HealthCheckInterval() time.Duration {
+	if c.Network.HealthCheckIntervalMin < 0 {
+		return 0
+	}
+	if c.Network.HealthCheckIntervalMin == 0 {
+		return 90 * time.Minute
+	}
+	return time.Duration(c.Network.HealthCheckIntervalMin) * time.Minute
+}
+
 // BypassNets returns parsed *net.IPNet objects for all configured bypass ranges
 // plus the RFC-1918 and loopback ranges that are always implicit.
 func (c *Config) BypassNets() ([]*net.IPNet, error) {
@@ -118,6 +158,17 @@ func (c *Config) BypassNets() ([]*net.IPNet, error) {
 		nets = append(nets, ipnet)
 	}
 	return nets, nil
+}
+
+// EnabledServers returns only the servers that participate in selection (priority > 0 or unset).
+func (c *Config) EnabledServers() []ServerEntry {
+	var out []ServerEntry
+	for _, s := range c.Servers {
+		if s.IsEnabled() {
+			out = append(out, s)
+		}
+	}
+	return out
 }
 
 // ─── Loading ───────────────────────────────────────────────────────────────
@@ -168,6 +219,7 @@ func (c *Config) validate() error {
 		return fmt.Errorf("config: at least one server must be defined under 'servers'")
 	}
 
+	enabledCount := 0
 	for i, s := range c.Servers {
 		if s.Host == "" {
 			return fmt.Errorf("config: server[%d] is missing 'host'", i)
@@ -181,6 +233,17 @@ func (c *Config) validate() error {
 		if s.Name == "" {
 			c.Servers[i].Name = fmt.Sprintf("%s:%d", s.Host, s.Socks5Port)
 		}
+		if s.Priority != nil && (*s.Priority < 0 || *s.Priority > 3) {
+			return fmt.Errorf("config: server[%d] (%s) has invalid priority %d (must be 0–3)",
+				i, s.Name, *s.Priority)
+		}
+		if s.IsEnabled() {
+			enabledCount++
+		}
+	}
+
+	if enabledCount == 0 {
+		return fmt.Errorf("config: all servers are disabled (priority=0); at least one must be enabled")
 	}
 
 	if c.Local.Socks5Port <= 0 || c.Local.Socks5Port > 65535 {
